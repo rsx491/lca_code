@@ -160,7 +160,6 @@ jobs:
             # Hard-disable feedback plugin at config level and try to uninstall if present
             sudo bash -c 'cat >/etc/mysql/mariadb.conf.d/99-disable-feedback.cnf <<"CFG"
 [mariadb]
-# ensure feedback plugin never loads
 plugin_load_add=
 CFG'
             sudo mysql -e "UNINSTALL SONAME '\''feedback'\'';" || true
