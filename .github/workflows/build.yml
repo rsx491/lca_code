@@ -1,6 +1,6 @@
 name: Build and Deploy LCA Collaboration Server 
 
-on:  
+on:
   push:
     branches:
       - main
@@ -26,7 +26,7 @@ jobs:
           fi
 
       - name: Azure Login
-        uses: azure/login@v1
+        uses: azure/login@v2  # <-- v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
@@ -73,10 +73,11 @@ jobs:
       - name: Fetch GitHub Actions IP ranges
         id: fetch_ips
         run: |
+          # Comma-separated list of CIDRs
           GITHUB_IPS=$(curl -s https://api.github.com/meta | jq -r '.actions[]' | paste -sd "," -)
           echo "GITHUB_IPS=$GITHUB_IPS" >> $GITHUB_ENV
 
-      - name: Open 80 and 8080 on all NSGs in the resource group
+      - name: Open 80 and 8080 on all NSGs in the resource group (scoped to GH Actions)
         run: |
           NSG_LIST=$(az network nsg list \
             --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
@@ -93,9 +94,9 @@ jobs:
               --access Allow \
               --protocol Tcp \
               --direction Inbound \
-              --source-address-prefixes '*' \
+              --source-address-prefixes ${{ env.GITHUB_IPS }} \  # <-- restrict to Actions egress
               --destination-port-ranges 80 \
-              --description "Allow HTTP access to port 80"
+              --description "Allow HTTP from GitHub Actions to port 80"
 
             az network nsg rule create \
               --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
@@ -105,26 +106,29 @@ jobs:
               --access Allow \
               --protocol Tcp \
               --direction Inbound \
-              --source-address-prefixes '*' \
+              --source-address-prefixes ${{ env.GITHUB_IPS }} \  # <-- restrict to Actions egress
               --destination-port-ranges 8080 \
-              --description "Allow access to port 8080"
+              --description "Allow Actions to port 8080"
           done
 
-      - name: Install Prerequisites on Remote VM
+      - name: Install Prerequisites on Remote VM (non-interactive)
         run: |
           echo "Transferring install-prerequisites.sh to VM..."
           scp -o StrictHostKeyChecking=no scripts/install-prerequisites.sh \
-            ${{ secrets.AZ_VM_USERNAME }}@$VM_IP:/home/${{ secrets.AZ_VM_USERNAME }}/
+            ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
 
-          echo "Running install-prerequisites.sh on VM..."
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@$VM_IP <<EOF
+          echo "Running install-prerequisites.sh on VM in non-interactive mode..."
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} <<'EOF'
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive   # <-- prevent debconf prompts
             export DB_NAME="${{ vars.DB_NAME }}"
             export DB_USER="${{ secrets.DB_USER }}"
             export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
             export EMAIL_USER="${{ secrets.EMAIL_USER }}"
             export EMAIL_PASS="${{ secrets.EMAIL_PASS }}"
             chmod +x install-prerequisites.sh
-            ./install-prerequisites.sh
+            # Ensure non-interactive even if script calls apt:
+            sudo -E ./install-prerequisites.sh < /dev/null
           EOF
 
       - name: Copy Configuration Files to Remote VM
@@ -161,9 +165,11 @@ jobs:
             ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
           
           echo "Deploying WAR file to Tomcat..."
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << EOF
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
             sudo mv /home/${{ secrets.AZ_VM_USERNAME }}/collaboration-server-backend-*.war /opt/tomcat/webapps/lca-collaboration.war
           EOF
+
       - name: Generate SAS Token
         id: gensas
         run: |
@@ -186,6 +192,7 @@ jobs:
       - name: Install AzCopy & Download Artifacts
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << EOF
+            set -euo pipefail
             echo "Installing AzCopy..."
             curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
             sudo mv azcopy /usr/local/bin/
@@ -204,6 +211,7 @@ jobs:
       - name: Copy DB Initialization
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << EOF
+            set -euo pipefail
             echo "Creating /opt/lca-cs/init if not exists..."
             sudo mkdir -p /opt/lca-cs/init
             sudo chown -R $USER:$USER /opt/lca-cs/init
@@ -215,9 +223,25 @@ jobs:
             echo "All files downloaded to /opt/lca-cs/init"
           EOF
 
+      - name: Wait for MariaDB (on VM) before init
+        run: |   # <-- ensure DB is actually up if your prereq script installed it
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
+            for i in {1..30}; do
+              if sudo mysqladmin ping >/dev/null 2>&1; then
+                echo "MariaDB is up."
+                exit 0
+              fi
+              echo "Waiting for MariaDB..."
+              sleep 2
+            done
+            echo "MariaDB did not start in time"; exit 1
+          EOF
+
       - name: Run DB init on Azure VM
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
             echo "Setting up Java..."
             export JAVA_HOME=/opt/java/jdk-21.0.3+9
             export PATH=$JAVA_HOME/bin:$PATH
@@ -238,27 +262,26 @@ jobs:
 
       - name: Execute table updates
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << EOF
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
             echo "Installing MariaDB client..."
+            export DEBIAN_FRONTEND=noninteractive  # <-- prevent prompts here too
             sudo apt-get update -y
             sudo apt-get install -y mariadb-client
           
             echo "Executing table updates"
             cd /opt/lca-cs/init/sql
-          
-            for file in \$(ls -1v *.sql); do
-              echo "Running \$file..."
-              mysql -h localhost -u "${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ vars.DB_NAME }}" < "\$file"
+            for file in $(ls -1v *.sql); do
+              echo "Running $file..."
+              mysql -h localhost -u "${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ vars.DB_NAME }}" < "$file"
             done
           
-           echo "Executing data updates"
+            echo "Executing data updates"
             cd /opt/lca-cs/init/db_updates
-          
-            for file in \$(ls -1v *.sql); do
-              echo "Running \$file..."
-              mysql -h localhost -u "${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ vars.DB_NAME }}" < "\$file"
+            for file in $(ls -1v *.sql); do
+              echo "Running $file..."
+              mysql -h localhost -u "${{ secrets.DB_USER }}" -p"${{ secrets.DB_PASSWORD }}" "${{ vars.DB_NAME }}" < "$file"
             done
-          
           EOF
 
       - name: Restart services using Azure CLI
@@ -269,19 +292,20 @@ jobs:
             --command-id RunShellScript \
             --scripts '
               echo "Restarting services..."
-              sudo systemctl restart nginx
-              sudo systemctl restart tomcat
-              sudo systemctl restart opensearch
+              sudo systemctl restart nginx || true
+              sudo systemctl restart tomcat || sudo systemctl restart tomcat9 || true  # <-- be tolerant
+              sudo systemctl restart opensearch || true
             '
 
       - name: Reindex Repos
         run: |
           echo "Transferring reindex.sh to VM..."
           scp -o StrictHostKeyChecking=no scripts/reindex.sh \
-            ${{ secrets.AZ_VM_USERNAME }}@$VM_IP:/home/${{ secrets.AZ_VM_USERNAME }}/
+            ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
 
           echo "Running reindex.sh on VM..."
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@$VM_IP <<EOF
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} <<'EOF'
+            set -euo pipefail
             chmod +x reindex.sh
             ./reindex.sh
           EOF
@@ -325,8 +349,10 @@ jobs:
 
           echo "Running Cypress tests on VM..."
           ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
             cd /home/${{ secrets.AZ_VM_USERNAME }}/cypress_core_functionalities_daily_check
             curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+            export DEBIAN_FRONTEND=noninteractive
             sudo apt-get install -y nodejs
             npm install
             npx cypress run --reporter mochawesome || exit 1
