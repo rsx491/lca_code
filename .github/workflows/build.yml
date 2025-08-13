@@ -117,7 +117,7 @@ jobs:
             BASE=$((PRIO+10))
           done
 
-      # --- UPDATED: hard non-interactive mode + MariaDB feedback preseed ---
+      # --- UPDATED: hard non-interactive mode, pre-install MariaDB w/o recommends, disable feedback plugin ---
       - name: Install Prerequisites on Remote VM (non-interactive, preseed MariaDB)
         run: |
           echo "Transferring install-prerequisites.sh to VM..."
@@ -132,11 +132,12 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             export DEBIAN_PRIORITY=critical
             export DEBCONF_NONINTERACTIVE_SEEN=true
-            export NEEDRESTART_MODE=a         # auto-restart services
-            export UCF_FORCE_CONFFNEW=1       # accept maintainer versions
+            export NEEDRESTART_MODE=a          # auto-restart services
+            export UCF_FORCE_CONFFNEW=1        # accept maintainer versions
+            APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -yq'
 
             sudo apt-get update -yq
-            sudo apt-get install -yq debconf-utils
+            sudo apt-get install -yq debconf-utils apt-utils
 
             # Preseed feedback prompt for common MariaDB package names (11.x/12.x etc.)
             for pkg in \
@@ -145,15 +146,27 @@ jobs:
               mariadb-server-11.0 mariadb-server-11.1 mariadb-server-11.2 mariadb-server-11.3 \
               mariadb-server-12.0 mariadb-server-12.1 mariadb-server-12.2
             do
-              # handle both "pkg/feedback_plugin" and "feedback_plugin" keys
               echo "$pkg $pkg/feedback_plugin boolean false" | sudo debconf-set-selections || true
               echo "$pkg feedback_plugin boolean false"        | sudo debconf-set-selections || true
             done
 
-            # Extra dpkg options to avoid prompts and keep going
-            APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -yq'
+            # Install MariaDB explicitly WITHOUT recommends so optional feedback plugin isn't pulled in
+            sudo apt-get install ${APT_OPTS} --no-install-recommends -yq mariadb-server mariadb-client
 
-            # Env for your script
+            # Ensure service is up
+            sudo systemctl enable mariadb || sudo systemctl enable mysql || true
+            sudo systemctl start  mariadb || sudo systemctl start  mysql || true
+
+            # Hard-disable feedback plugin at config level and try to uninstall if present
+            sudo bash -c 'cat >/etc/mysql/mariadb.conf.d/99-disable-feedback.cnf <<CFG
+[mariadb]
+# ensure feedback plugin never loads
+plugin_load_add=
+CFG'
+            sudo mysql -e "UNINSTALL SONAME '\''feedback'\'';" || true
+            sudo systemctl restart mariadb || sudo systemctl restart mysql || true
+
+            # ---- Run YOUR prerequisites script last (still fully non-interactive) ----
             export DB_NAME="${{ vars.DB_NAME }}"
             export DB_USER="${{ secrets.DB_USER }}"
             export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
@@ -161,8 +174,9 @@ jobs:
             export EMAIL_PASS="${{ secrets.EMAIL_PASS }}"
             chmod +x install-prerequisites.sh
 
-            # Run with stdin closed to block any interactive fallbacks
-            sudo -E ./install-prerequisites.sh ${APT_OPTS} < /dev/null
+            # Protect against any lingering prompts/hangs with a timeout
+            command -v timeout >/dev/null 2>&1 || sudo apt-get install -yq coreutils
+            sudo -E timeout 20m ./install-prerequisites.sh ${APT_OPTS} < /dev/null
           EOF
 
       - name: Copy Configuration Files to Remote VM
@@ -374,7 +388,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cypress-ui-screenshots
-          path: ./cypress-screenshots
+        path: ./cypress-screenshots
 
       - name: Run API Tests
         env:
