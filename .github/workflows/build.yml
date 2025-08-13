@@ -70,63 +70,31 @@ jobs:
           VM_IP=$(jq -r '.publicIpAddress' vm.json)
           echo "VM_IP=$VM_IP" >> $GITHUB_ENV
 
-      - name: Fetch GitHub Actions IP ranges
-        id: fetch_ips
-        run: |
-          # Keep only IPv4 ranges (exclude IPv6 with ':') and store as newline list
-          curl -s https://api.github.com/meta | jq -r '.actions[] | select(test(":") | not)' > gh_actions_ipv4.txt
-
-      - name: Open 80 and 8080 on all NSGs in the resource group (scoped to GH Actions)
+      # --- NEW: scope NSG to only this runner’s public IP (/32) ---
+      - name: Allow runner IP on VM NSG for 22/80/8080
         run: |
           set -euo pipefail
+          echo "Detecting runner egress IP…"
+          MYIP=$(curl -s https://api.ipify.org)
+          echo "Runner IP: $MYIP"
 
-          # Load IPv4 ranges into bash array
-          mapfile -t IPS < gh_actions_ipv4.txt
-          if [ ${#IPS[@]} -eq 0 ]; then
-            echo "No GitHub Actions IPv4 ranges found"; exit 1
-          fi
+          NSG_NAME="${VM_NAME}NSG"   # default NSG name created with az vm create
+          echo "Target NSG: $NSG_NAME"
 
-          NSG_LIST=$(az network nsg list --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --query "[].name" -o tsv)
-
-          CHUNK=50
-          for NSG in $NSG_LIST; do
-            echo "Updating NSG: $NSG"
-            total=${#IPS[@]}
-            idx=0
-            prio=1001
-
-            while [ $idx -lt $total ]; do
-              slice=( "${IPS[@]:$idx:$CHUNK}" )
-              part=$(( idx / CHUNK + 1 ))
-
-              az network nsg rule create \
-                --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
-                --nsg-name "$NSG" \
-                --name AllowHTTP-${{ github.run_id }}-p$part \
-                --priority $prio \
-                --access Allow \
-                --protocol Tcp \
-                --direction Inbound \
-                --source-address-prefixes "${slice[@]}" \
-                --destination-port-ranges 80 \
-                --description "Allow HTTP from GitHub Actions (part $part)"
-              prio=$(( prio + 1 ))
-
-              az network nsg rule create \
-                --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
-                --nsg-name "$NSG" \
-                --name Allow8080-${{ github.run_id }}-p$part \
-                --priority $prio \
-                --access Allow \
-                --protocol Tcp \
-                --direction Inbound \
-                --source-address-prefixes "${slice[@]}" \
-                --destination-port-ranges 8080 \
-                --description "Allow 8080 from GitHub Actions (part $part)"
-              prio=$(( prio + 1 ))
-
-              idx=$(( idx + CHUNK ))
-            done
+          # open SSH, 80, 8080 only from this runner
+          for PORT in 22 80 8080; do
+            PRIO=$((2000 + PORT))
+            az network nsg rule create \
+              --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+              --nsg-name "$NSG_NAME" \
+              --name Allow-${PORT}-${{ github.run_id }} \
+              --priority $PRIO \
+              --access Allow \
+              --protocol Tcp \
+              --direction Inbound \
+              --source-address-prefixes "${MYIP}/32" \
+              --destination-port-ranges $PORT \
+              --description "Temporary allow from GH runner ${MYIP} to port $PORT"
           done
 
       - name: Install Prerequisites on Remote VM (non-interactive)
@@ -316,7 +284,7 @@ jobs:
             COUNT=$((COUNT+1))
             echo "Attempt $COUNT of $MAX_RETRIES: App not yet available..."
             if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
-              echo "App did not become ready after $((MAX_RETRIES * RETRY_INTERVAL)) seconds)."
+              echo "App did not become ready after $((MAX_RETRIES * $RETRY_INTERVAL)) seconds)."
               exit 1
             fi
             sleep $RETRY_INTERVAL
@@ -371,6 +339,14 @@ jobs:
         if: always()
         run: |
           echo "Cleaning up all resources for $VM_NAME"
+
+          # Remove the temporary NSG rules (in case NSG is shared)
+          for PORT in 22 80 8080; do
+            az network nsg rule delete \
+              --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+              --nsg-name ${VM_NAME}NSG \
+              --name Allow-${PORT}-${{ github.run_id }} || true
+          done
           
           if az vm show --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name $VM_NAME &> /dev/null; then
             echo "Deleting VM..."
