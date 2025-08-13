@@ -132,8 +132,8 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             export DEBIAN_PRIORITY=critical
             export DEBCONF_NONINTERACTIVE_SEEN=true
-            export NEEDRESTART_MODE=a          # auto-restart services
-            export UCF_FORCE_CONFFNEW=1        # accept maintainer versions
+            export NEEDRESTART_MODE=a
+            export UCF_FORCE_CONFFNEW=1
             APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -yq'
 
             sudo apt-get update -yq
@@ -347,7 +347,7 @@ CFG'
             COUNT=$((COUNT+1))
             echo "Attempt $COUNT of $MAX_RETRIES: App not yet available..."
             if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
-              echo "App did not become ready after $((MAX_RETRIES * $RETRY_INTERVAL)) seconds)."
+              echo "App did not become ready after $((MAX_RETRIES * RETRY_INTERVAL)) seconds."
               exit 1
             fi
             sleep $RETRY_INTERVAL
@@ -388,7 +388,7 @@ CFG'
         uses: actions/upload-artifact@v4
         with:
           name: cypress-ui-screenshots
-        path: ./cypress-screenshots
+          path: ./cypress-screenshots
 
       - name: Run API Tests
         env:
