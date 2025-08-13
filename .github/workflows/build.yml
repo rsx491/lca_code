@@ -70,7 +70,7 @@ jobs:
           VM_IP=$(jq -r '.publicIpAddress' vm.json)
           echo "VM_IP=$VM_IP" >> $GITHUB_ENV
 
-      # --- NEW: scope NSG to only this runner’s public IP (/32) ---
+      # --- UPDATED: scope NSG to this runner’s IP using safe priorities ---
       - name: Allow runner IP on VM NSG for 22/80/8080
         run: |
           set -euo pipefail
@@ -81,20 +81,41 @@ jobs:
           NSG_NAME="${VM_NAME}NSG"   # default NSG name created with az vm create
           echo "Target NSG: $NSG_NAME"
 
-          # open SSH, 80, 8080 only from this runner
+          # Helper: find the next free NSG priority (100–4096), starting at a base and stepping by 10
+          next_priority () {
+            local base=$1
+            local used pri
+            mapfile -t used < <(az network nsg rule list \
+              --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+              --nsg-name "$NSG_NAME" \
+              --query '[].priority' -o tsv | sort -n | uniq)
+            pri=$base
+            while printf '%s\n' "${used[@]:-}" | grep -qx "$pri"; do
+              pri=$((pri+10))
+            done
+            if [ "$pri" -lt 100 ] || [ "$pri" -gt 4096 ]; then
+              echo "No free NSG priority available within 100–4096" >&2
+              exit 1
+            fi
+            echo "$pri"
+          }
+
+          BASE=1200
           for PORT in 22 80 8080; do
-            PRIO=$((2000 + PORT))
+            PRIO=$(next_priority "$BASE")
+            echo "Creating rule for port $PORT with priority $PRIO"
             az network nsg rule create \
               --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
               --nsg-name "$NSG_NAME" \
               --name Allow-${PORT}-${{ github.run_id }} \
-              --priority $PRIO \
+              --priority "$PRIO" \
               --access Allow \
               --protocol Tcp \
               --direction Inbound \
               --source-address-prefixes "${MYIP}/32" \
-              --destination-port-ranges $PORT \
+              --destination-port-ranges "$PORT" \
               --description "Temporary allow from GH runner ${MYIP} to port $PORT"
+            BASE=$((PRIO+10))
           done
 
       - name: Install Prerequisites on Remote VM (non-interactive)
