@@ -108,71 +108,85 @@ jobs:
             BASE=$((PRIO+10))
           done
 
-      # === Hardened non-interactive MariaDB install (preseed + seen, disable plugin) ===
+      # --- Hardened non-interactive MariaDB install + line-buffered script run ---
       - name: Install Prerequisites on Remote VM (non-interactive, preseed MariaDB)
         run: |
           echo "Transferring install-prerequisites.sh to VM..."
           scp -o StrictHostKeyChecking=no scripts/install-prerequisites.sh \
             ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
 
-          echo "Running install-prerequisites.sh on VM (hard non-interactive)..."
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} <<'EOSSH'
-          set -euo pipefail
+          echo "Running install-prerequisites.sh on VM (hard non-interactive, line-buffered)..."
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} <<'EOF'
+            set -Eeuo pipefail
 
-          export DEBIAN_FRONTEND=noninteractive
-          export DEBIAN_PRIORITY=critical
-          export DEBCONF_NONINTERACTIVE_SEEN=true
-          export DEBCONF_NOWARNINGS=yes
-          export DEBCONF_TERSE=yes
-          export APT_LISTCHANGES_FRONTEND=none
-          export NEEDRESTART_MODE=a
-          export UCF_FORCE_CONFFNEW=1
+            # Global no-prompt settings
+            export DEBIAN_FRONTEND=noninteractive
+            export DEBIAN_PRIORITY=critical
+            export DEBCONF_NONINTERACTIVE_SEEN=true
+            export APT_LISTCHANGES_FRONTEND=none
+            export NEEDRESTART_MODE=a
+            export UCF_FORCE_CONFFNEW=1
 
-          APT_OPTS='-yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Dpkg::Progress-Fancy=0 -o Acquire::Retries=3'
+            # Extra dpkg/apt options and disable PTY to avoid odd debconf behavior
+            APT_OPTS='-yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Dpkg::Progress-Fancy=0'
 
-          sudo apt-get update -yq
-          sudo apt-get install -yq debconf-utils apt-utils coreutils
+            sudo apt-get update -yq
+            sudo apt-get install -yq debconf-utils apt-utils coreutils moreutils || true
+            echo 'DPkg::Options { "--force-confdef"; "--force-confold"; };' | sudo tee /etc/apt/apt.conf.d/99force-noninteractive >/dev/null || true
 
-          printf 'SET frontend Noninteractive\n' | sudo debconf-communicate debconf >/dev/null || true
+            # Preseed MariaDB feedback prompt (belt & suspenders)
+            for owner in \
+              mariadb-server mariadb-server-core \
+              mariadb-server-10.6 mariadb-server-10.11 \
+              mariadb-server-11.0 mariadb-server-11.1 mariadb-server-11.2 mariadb-server-11.3 \
+              mariadb-server-12.0 mariadb-server-12.1 mariadb-server-12.2
+            do
+              echo "$owner mariadb-server/feedback_plugin boolean false" | sudo debconf-set-selections || true
+              echo "$owner mariadb-server/feedback_plugin seen true"    | sudo debconf-set-selections || true
+            done
 
-          # Disable plugin via config BEFORE install so postinst sees it
-          sudo install -d /etc/mysql/mariadb.conf.d
-          sudo tee /etc/mysql/mariadb.conf.d/99-disable-feedback.cnf >/dev/null <<'EOCNF'
-          [mariadb]
-          plugin_load_add=
-          EOCNF
-
-          # Preseed all likely keys and mark as seen
-          sudo debconf-set-selections <<'EODEB'
-          mariadb-server-10.6 mariadb-server/feedback_plugin boolean false
-          mariadb-server-10.6 mariadb-server/feedback_plugin seen true
-          mariadb-server-10.6 mariadb-server-10.6/feedback_plugin boolean false
-          mariadb-server-10.6 mariadb-server-10.6/feedback_plugin seen true
-          mariadb-server      mariadb-server/feedback_plugin boolean false
-          mariadb-server      mariadb-server/feedback_plugin seen true
-          mariadb-server      mariadb-server-10.6/feedback_plugin boolean false
-          mariadb-server      mariadb-server-10.6/feedback_plugin seen true
-          EODEB
-
-          # Install w/ fallback "no" on stdin as last resort
-          printf 'no\n' | sudo -E timeout 25m apt-get install ${APT_OPTS} --no-install-recommends mariadb-server mariadb-client </dev/null
-
-          sudo systemctl enable mariadb || sudo systemctl enable mysql || true
-          sudo systemctl start  mariadb || sudo systemctl start  mysql || true
-
-          sudo mysql -e "UNINSTALL SONAME 'feedback';" || true
-          sudo systemctl restart mariadb || sudo systemctl restart mysql || true
-          sudo systemctl is-active --quiet mariadb && echo "MariaDB is active."
-
-          # ---- Project prerequisites (remain non-interactive) ----
-          export DB_NAME="${{ vars.DB_NAME }}"
-          export DB_USER="${{ secrets.DB_USER }}"
-          export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
-          export EMAIL_USER="${{ secrets.EMAIL_USER }}"
-          export EMAIL_PASS="${{ secrets.EMAIL_PASS }}"
-          chmod +x install-prerequisites.sh
-          sudo -E timeout 20m ./install-prerequisites.sh ${APT_OPTS} < /dev/null
-          EOSSH
+            # Hard-disable plugin via config before any install
+            sudo install -d /etc/mysql/mariadb.conf.d
+            sudo tee /etc/mysql/mariadb.conf.d/99-disable-feedback.cnf >/dev/null <<'CFG'
+            
+            [mariadb]
+            plugin_load_add=
+            CFG
+            
+                        chmod +x install-prerequisites.sh
+            
+                        # ---- RUN your script with line-buffered output and a bounded timeout ----
+                        # stdbuf is from coreutils; if moreutils is present, ts adds timestamps
+                        if command -v stdbuf >/dev/null 2>&1; then
+                          RUNNER="stdbuf -oL -eL"
+                        else
+                          RUNNER=""
+                        fi
+            
+                        # Make sure we always dump MariaDB status & logs if the script fails or times out
+                        set +e
+                        ${RUNNER} timeout 12m ./install-prerequisites.sh ${APT_OPTS} 2>&1 | sed -u 's/^/[install-prereq] /'
+                        rc=$?
+                        set -e
+            
+                        if [ $rc -ne 0 ]; then
+                          echo "install-prerequisites.sh exited with code $rc — showing MariaDB status & last 200 lines of logs"
+                          sudo systemctl status mariadb --no-pager || true
+                          sudo journalctl -u mariadb --no-pager -n 200 || true
+                          exit $rc
+                        fi
+            
+                        # Extra readiness probe (fast) so the next steps don't "look hung"
+                        echo "Sanity check: mysqladmin ping..."
+                        for i in $(seq 1 60); do
+                          if sudo mysqladmin ping >/dev/null 2>&1; then
+                            echo "MariaDB is responding (mysqladmin ping)."
+                            break
+                          fi
+                          echo "Waiting for MariaDB to respond... ($i/60)"
+                          sleep 2
+                        done
+                      EOF
 
       - name: Copy Configuration Files to Remote VM
         run: |
