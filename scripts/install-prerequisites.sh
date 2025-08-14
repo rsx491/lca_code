@@ -20,51 +20,20 @@ else
   echo "Java 21.0.3 installed."
 fi
 
-# ------------------ MariaDB 10.11 (non-interactive, no feedback plugin) ------------------
+# ------------------ MariaDB 10.11 ------------------
+set -Eeuo pipefail
+
 echo "Checking MariaDB..."
-
-# Hard non-interactive apt/debconf
-export DEBIAN_FRONTEND=noninteractive
-export DEBIAN_PRIORITY=critical
-export DEBCONF_NONINTERACTIVE_SEEN=true
-export APT_LISTCHANGES_FRONTEND=none
-export NEEDRESTART_MODE=a
-export UCF_FORCE_CONFFNEW=1
-APT_OPTS='-yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Dpkg::Progress-Fancy=0'
-
-if mariadb --version 2>/dev/null | grep -qE '10\.11'; then
+if mariadb --version 2>/dev/null | grep -q "10\.11"; then
   echo "MariaDB 10.11 is already installed."
 else
   echo "Installing MariaDB 10.11..."
-
-  # Add/refresh MariaDB upstream repo (idempotent)
-  curl -fsSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash
-
-  # Disable feedback plugin via config BEFORE install so postinst won't prompt
-  sudo install -d /etc/mysql/mariadb.conf.d
-  sudo tee /etc/mysql/mariadb.conf.d/99-disable-feedback.cnf >/dev/null <<'CFG'
-[mariadb]
-plugin_load_add=
-CFG
-
-  # Preseed the feedback prompt to "false" and mark as seen
-  sudo debconf-set-selections <<'DEB'
-mariadb-server-10.11 mariadb-server/feedback_plugin boolean false
-mariadb-server-10.11 mariadb-server/feedback_plugin seen true
-mariadb-server       mariadb-server/feedback_plugin boolean false
-mariadb-server       mariadb-server/feedback_plugin seen true
-DEB
-
-  sudo apt-get update -yq
-  # Install without recommends to avoid pulling feedback plugin packages
-  sudo -E apt-get install ${APT_OPTS} --no-install-recommends mariadb-server mariadb-client
-
-  sudo systemctl enable mariadb || sudo systemctl enable mysql || true
-  sudo systemctl start  mariadb || sudo systemctl start  mysql || true
-
-  # Try to remove the plugin if it slipped in anyway
-  sudo mariadb -e "UNINSTALL SONAME 'feedback';" >/dev/null 2>&1 || true
-
+  # Upstream repo installer is non-interactive
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash
+  sudo apt-get update -y
+  sudo apt-get install -y mariadb-server
+  sudo systemctl enable mariadb
+  sudo systemctl start mariadb
   echo "MariaDB 10.11 installed and started."
 fi
 
@@ -72,27 +41,47 @@ fi
 echo "Setting up MariaDB database and user..."
 
 DB_NAME="${DB_NAME:-lca}"
-DB_USER="${DB_USER:-lca}"
+DB_USER="${DB_USER:-lca}"        # tolerate unset -> default
 DB_PASS="${DB_PASSWORD:-lca}"
 
-# Wait (bounded) for server to respond
+# Bounded readiness wait (max ~2 minutes)
+echo "Waiting for MariaDB socket to be ready..."
+ready=0
 for i in $(seq 1 60); do
-  if sudo mariadb -e "SELECT 1;" >/dev/null 2>&1; then
+  if sudo mysqladmin --protocol=socket ping >/dev/null 2>&1; then
+    ready=1
     break
   fi
-  echo "Waiting for MariaDB to start... ($i/60)"
+  echo "  ...not ready yet ($i/60)"
   sleep 2
 done
-# Final check
-sudo mariadb -e "SELECT 1;" >/dev/null 2>&1 || { echo "MariaDB did not start in time"; exit 1; }
 
-# DB & user
-sudo mariadb -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
-sudo mariadb -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-sudo mariadb -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
-sudo mariadb -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
-sudo mariadb -e "FLUSH PRIVILEGES;"
+if [ "$ready" -ne 1 ]; then
+  echo "MariaDB did not become ready in time — showing status and recent logs:"
+  sudo systemctl status mariadb --no-pager || true
+  sudo journalctl -u mariadb --no-pager -n 200 || true
+  exit 1
+fi
+echo "MariaDB is ready."
 
+# Use short timeouts so client never hangs indefinitely
+SQL_OPTS=(--connect-timeout=5 --wait-timeout=5 --protocol=socket)
+
+sudo mariadb "${SQL_OPTS[@]}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
+# Check if user exists
+USER_EXISTS=$(sudo mariadb "${SQL_OPTS[@]}" -N -e \
+  "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host='localhost';" || echo 0)
+
+if [ "${USER_EXISTS}" = "0" ]; then
+  echo "Creating MariaDB user '${DB_USER}'..."
+  sudo mariadb "${SQL_OPTS[@]}" -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+else
+  echo "User '${DB_USER}' exists. Updating password..."
+  sudo mariadb "${SQL_OPTS[@]}" -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+fi
+
+sudo mariadb "${SQL_OPTS[@]}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+sudo mariadb "${SQL_OPTS[@]}" -e "FLUSH PRIVILEGES;"
 echo "MariaDB database '${DB_NAME}' and user '${DB_USER}' configured."
 
 # ------------------ OpenSearch 2.19 ------------------
