@@ -77,7 +77,8 @@ jobs:
           NSG_NAME="${VM_NAME}NSG"
 
           next_priority () {
-            local base=$1 used pri
+            local base=$1
+            local used pri
             mapfile -t used < <(az network nsg rule list \
               --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
               --nsg-name "$NSG_NAME" \
@@ -98,14 +99,16 @@ jobs:
               --nsg-name "$NSG_NAME" \
               --name Allow-${PORT}-${{ github.run_id }} \
               --priority "$PRIO" \
-              --access Allow --protocol Tcp --direction Inbound \
+              --access Allow \
+              --protocol Tcp \
+              --direction Inbound \
               --source-address-prefixes "${MYIP}/32" \
               --destination-port-ranges "$PORT" \
               --description "Temporary allow from GH runner ${MYIP} to port $PORT"
             BASE=$((PRIO+10))
           done
 
-      # ---------- FIXED: safe heredocs, no nested quotes ----------
+      # === Hardened non-interactive MariaDB install (preseed + seen, disable plugin) ===
       - name: Install Prerequisites on Remote VM (non-interactive, preseed MariaDB)
         run: |
           echo "Transferring install-prerequisites.sh to VM..."
@@ -119,47 +122,49 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           export DEBIAN_PRIORITY=critical
           export DEBCONF_NONINTERACTIVE_SEEN=true
+          export DEBCONF_NOWARNINGS=yes
+          export DEBCONF_TERSE=yes
           export APT_LISTCHANGES_FRONTEND=none
           export NEEDRESTART_MODE=a
           export UCF_FORCE_CONFFNEW=1
 
-          APT_OPTS='-yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Dpkg::Progress-Fancy=0'
+          APT_OPTS='-yq -o Dpkg::Use-Pty=0 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Dpkg::Progress-Fancy=0 -o Acquire::Retries=3'
 
           sudo apt-get update -yq
           sudo apt-get install -yq debconf-utils apt-utils coreutils
-          echo 'DPkg::Options { "--force-confdef"; "--force-confold"; };' | sudo tee /etc/apt/apt.conf.d/99force-noninteractive >/dev/null
+
           printf 'SET frontend Noninteractive\n' | sudo debconf-communicate debconf >/dev/null || true
 
-          # Preseed + mark seen
-          for owner in \
-            mariadb-server mariadb-server-core \
-            mariadb-server-10.6 mariadb-server-10.11 \
-            mariadb-server-11.0 mariadb-server-11.1 mariadb-server-11.2 mariadb-server-11.3 \
-            mariadb-server-12.0 mariadb-server-12.1 mariadb-server-12.2
-          do
-            echo "$owner mariadb-server/feedback_plugin boolean false" | sudo debconf-set-selections || true
-            echo "$owner mariadb-server/feedback_plugin seen true"    | sudo debconf-set-selections || true
-          done
-
-          # Install MariaDB without recommends
-          sudo -E timeout 15m apt-get install ${APT_OPTS} --no-install-recommends mariadb-server mariadb-client
-
-          sudo systemctl enable mariadb || sudo systemctl enable mysql || true
-          sudo systemctl start  mariadb || sudo systemctl start  mysql || true
-
-          # Ensure feedback plugin is never loaded
+          # Disable plugin via config BEFORE install so postinst sees it
+          sudo install -d /etc/mysql/mariadb.conf.d
           sudo tee /etc/mysql/mariadb.conf.d/99-disable-feedback.cnf >/dev/null <<'EOCNF'
           [mariadb]
           plugin_load_add=
           EOCNF
 
-          # Try to uninstall plugin if present (ignore errors)
-          sudo mysql -e "UNINSTALL SONAME 'feedback';" || true
+          # Preseed all likely keys and mark as seen
+          sudo debconf-set-selections <<'EODEB'
+          mariadb-server-10.6 mariadb-server/feedback_plugin boolean false
+          mariadb-server-10.6 mariadb-server/feedback_plugin seen true
+          mariadb-server-10.6 mariadb-server-10.6/feedback_plugin boolean false
+          mariadb-server-10.6 mariadb-server-10.6/feedback_plugin seen true
+          mariadb-server      mariadb-server/feedback_plugin boolean false
+          mariadb-server      mariadb-server/feedback_plugin seen true
+          mariadb-server      mariadb-server-10.6/feedback_plugin boolean false
+          mariadb-server      mariadb-server-10.6/feedback_plugin seen true
+          EODEB
 
+          # Install w/ fallback "no" on stdin as last resort
+          printf 'no\n' | sudo -E timeout 25m apt-get install ${APT_OPTS} --no-install-recommends mariadb-server mariadb-client </dev/null
+
+          sudo systemctl enable mariadb || sudo systemctl enable mysql || true
+          sudo systemctl start  mariadb || sudo systemctl start  mysql || true
+
+          sudo mysql -e "UNINSTALL SONAME 'feedback';" || true
           sudo systemctl restart mariadb || sudo systemctl restart mysql || true
           sudo systemctl is-active --quiet mariadb && echo "MariaDB is active."
 
-          # ----- your prerequisites (kept non-interactive) -----
+          # ---- Project prerequisites (remain non-interactive) ----
           export DB_NAME="${{ vars.DB_NAME }}"
           export DB_USER="${{ secrets.DB_USER }}"
           export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
@@ -208,7 +213,6 @@ jobs:
           ACCOUNT_KEY=$(az storage account keys list \
             --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
             --query '[0].value' -o tsv)
-
           SAS=$(az storage container generate-sas \
             --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
             --name ${{ secrets.AZURE_CONTAINER_NAME }} \
@@ -217,7 +221,6 @@ jobs:
             --account-key "$ACCOUNT_KEY" \
             --https-only \
             --output tsv)
-
           echo "sas_token=$SAS" >> "$GITHUB_OUTPUT"
 
       - name: Install AzCopy & Download Artifacts
@@ -226,7 +229,6 @@ jobs:
             set -euo pipefail
             curl -sL https://aka.ms/downloadazcopy-v10-linux | tar -xz --strip-components=1
             sudo mv azcopy /usr/local/bin/
-
             sudo mkdir -p /opt/lca-cs/repository
             sudo chown -R $USER:$USER /opt/lca-cs/repository
             sudo chmod -R 777 /opt/lca-cs/repository
@@ -337,7 +339,7 @@ jobs:
             COUNT=$((COUNT+1))
             echo "Attempt $COUNT of $MAX_RETRIES: App not yet available..."
             if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
-              echo "App did not become ready after $((MAX_RETRIES * $RETRY_INTERVAL)) seconds."
+              echo "App did not become ready after $((MAX_RETRIES * RETRY_INTERVAL)) seconds."
               exit 1
             fi
             sleep $RETRY_INTERVAL
@@ -398,13 +400,16 @@ jobs:
               --nsg-name ${VM_NAME}NSG \
               --name Allow-${PORT}-${{ github.run_id }} || true
           done
+
           if az vm show --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name $VM_NAME &> /dev/null; then
             az vm delete --yes --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name $VM_NAME
           fi
+
           OS_DISK_NAME=$(az disk list --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --query "[?contains(name,'$VM_NAME')].name" -o tsv)
           if [ -n "$OS_DISK_NAME" ]; then
             az disk delete --name "$OS_DISK_NAME" --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --yes
           fi
+
           NIC_NAME=$(az network nic list --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --query "[?contains(name,'$VM_NAME')].name" -o tsv)
           if [ -n "$NIC_NAME" ]; then
             az network nic ip-config update \
@@ -418,6 +423,13 @@ jobs:
               --remove networkSecurityGroup || true
             az network nic delete --name $NIC_NAME --resource-group ${{ secrets.AZ_RESOURCE_GROUP }}
           fi
-          az network public-ip delete --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name ${VM_NAME}PublicIP || true
-          az network nsg delete --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} --name ${VM_NAME}NSG || true
+
+          az network public-ip delete \
+            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+            --name ${VM_NAME}PublicIP || true
+
+          az network nsg delete \
+            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+            --name ${VM_NAME}NSG || true
+
           echo "Cleanup complete."
