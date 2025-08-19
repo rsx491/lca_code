@@ -210,39 +210,47 @@ jobs:
         with:
           name: lca-war
           path: backend/target/collaboration-server-backend-*.war
-
       - name: Ensure Tomcat installed and webapps exists
+        timeout-minutes: 20
         run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
-            set -euo pipefail
-            # Install Tomcat9 if missing
-            if ! systemctl list-unit-files | grep -q '^tomcat9\.service'; then
-              export DEBIAN_FRONTEND=noninteractive
-              sudo apt-get update -y
-              sudo apt-get install -y tomcat9
-            fi
+          ssh -tt -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            export NEEDRESTART_MODE=a   # auto-restart services, avoid prompt
 
-            # Normalize to /opt/tomcat if apt installed to /var/lib/tomcat9
+            # Wait for cloud-init / unattended-upgrades to release apt locks
+            (command -v cloud-init >/dev/null && sudo cloud-init status --wait) || true
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+              echo "waiting for apt lock..."; sleep 5
+            done
+
+            # Update/install with unbuffered output and no fancy progress
+            sudo apt-get update -y -o Dpkg::Progress-Fancy=0 -o Dpkg::Use-Pty=0
+            sudo apt-get install -y -o Dpkg::Progress-Fancy=0 -o Dpkg::Use-Pty=0 tomcat9 \
+              | stdbuf -o0 -e0 sed -u 's/^/[apt] /'
+
+            # Normalize layout if apt put Tomcat under /var/lib/tomcat9
             if [ -d /var/lib/tomcat9/webapps ]; then
-              sudo install -d -m 755 /opt/tomcat
+              sudo mkdir -p /opt/tomcat
               sudo ln -sfn /var/lib/tomcat9 /opt/tomcat
             fi
 
-            # Ensure target directory exists
+            sudo systemctl enable --now tomcat9 || true
             sudo install -d -m 755 /opt/tomcat/webapps
-
-            # Make sure service is enabled/running
-            sudo systemctl enable --now tomcat9 || sudo systemctl enable --now tomcat || true
           EOF
-
       - name: Copy WAR to Tomcat
         run: |
           scp -o StrictHostKeyChecking=no backend/target/collaboration-server-backend-*.war \
             ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
           ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
             set -euo pipefail
+            # Fail fast if the WAR didn't land
+            ls -l /home/${{ secrets.AZ_VM_USERNAME }}/collaboration-server-backend-*.war
+
+            # Move into Tomcat; directory guaranteed by previous step
             sudo mv /home/${{ secrets.AZ_VM_USERNAME }}/collaboration-server-backend-*.war /opt/tomcat/webapps/lca-collaboration.war
           EOF
+
 
       - name: Generate SAS Token
         id: gensas
