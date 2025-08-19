@@ -238,18 +238,40 @@ jobs:
             sudo systemctl enable --now tomcat9 || true
             sudo install -d -m 755 /opt/tomcat/webapps
           EOF
+      - name: Resolve WAR artifact
+        run: |
+          set -euo pipefail
+          echo "Looking for WAR in backend/target..."
+          WAR=$(ls -1 backend/target/*.war | head -n 1 || true)
+          if [ -z "$WAR" ]; then
+            echo "ERROR: No WAR found under backend/target/" >&2
+            ls -l backend/target || true
+            exit 1
+          fi
+          echo "WAR_PATH=$WAR" >> $GITHUB_ENV
+          echo "WAR_BASENAME=$(basename "$WAR")" >> $GITHUB_ENV
+          echo "Resolved WAR: $WAR"
       - name: Copy WAR to Tomcat
         run: |
-          scp -o StrictHostKeyChecking=no backend/target/collaboration-server-backend-*.war \
-            ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
-          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
-            set -euo pipefail
-            # Fail fast if the WAR didn't land
-            ls -l /home/${{ secrets.AZ_VM_USERNAME }}/collaboration-server-backend-*.war
+          set -euxo pipefail
+          # Show the artifact resolved from previous step
+          echo "WAR_PATH=${{ env.WAR_PATH }}"
+          echo "WAR_BASENAME=${{ env.WAR_BASENAME }}"
+          test -f "${{ env.WAR_PATH }}"
 
-            # Move into Tomcat; directory guaranteed by previous step
-            sudo mv /home/${{ secrets.AZ_VM_USERNAME }}/collaboration-server-backend-*.war /opt/tomcat/webapps/lca-collaboration.war
-          EOF
+          # Copy the artifact to the VM user's home
+          scp -vvv -o StrictHostKeyChecking=no "${{ env.WAR_PATH }}" \
+            ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }}:/home/${{ secrets.AZ_VM_USERNAME }}/
+
+          # Verify on remote and deploy into Tomcat
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} \
+            "set -euo pipefail; \
+             ls -l /home/${{ secrets.AZ_VM_USERNAME }}/${{ env.WAR_BASENAME }}; \
+             sudo mv /home/${{ secrets.AZ_VM_USERNAME }}/${{ env.WAR_BASENAME }} /opt/tomcat/webapps/lca-collaboration.war; \
+             ls -l /opt/tomcat/webapps/; \
+             (systemctl is-active tomcat9 && sudo systemctl restart tomcat9) || true; \
+             echo 'Deploy done'"
+
 
 
       - name: Generate SAS Token
