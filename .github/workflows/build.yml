@@ -211,6 +211,30 @@ jobs:
           name: lca-war
           path: backend/target/collaboration-server-backend-*.war
 
+      - name: Ensure Tomcat installed and webapps exists
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.AZ_VM_USERNAME }}@${{ env.VM_IP }} << 'EOF'
+            set -euo pipefail
+            # Install Tomcat9 if missing
+            if ! systemctl list-unit-files | grep -q '^tomcat9\.service'; then
+              export DEBIAN_FRONTEND=noninteractive
+              sudo apt-get update -y
+              sudo apt-get install -y tomcat9
+            fi
+
+            # Normalize to /opt/tomcat if apt installed to /var/lib/tomcat9
+            if [ -d /var/lib/tomcat9/webapps ]; then
+              sudo install -d -m 755 /opt/tomcat
+              sudo ln -sfn /var/lib/tomcat9 /opt/tomcat
+            fi
+
+            # Ensure target directory exists
+            sudo install -d -m 755 /opt/tomcat/webapps
+
+            # Make sure service is enabled/running
+            sudo systemctl enable --now tomcat9 || sudo systemctl enable --now tomcat || true
+          EOF
+
       - name: Copy WAR to Tomcat
         run: |
           scp -o StrictHostKeyChecking=no backend/target/collaboration-server-backend-*.war \
