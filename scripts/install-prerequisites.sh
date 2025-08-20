@@ -1,5 +1,11 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# make ALL apt/dpkg operations non-interactive
+export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_PRIORITY=critical
+
 
 echo "Starting prerequisite installation..."
 
@@ -21,17 +27,26 @@ else
 fi
 
 # ------------------ MariaDB 10.11 ------------------
-set -Eeuo pipefail
-
 echo "Checking MariaDB..."
-if mariadb --version 2>/dev/null | grep -q "10\.11"; then
+if mariadb --version 2>/dev/null | grep "10.11"; then
   echo "MariaDB 10.11 is already installed."
 else
   echo "Installing MariaDB 10.11..."
-  # Upstream repo installer is non-interactive
-  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash
-  sudo apt-get update -y
-  sudo apt-get install -y mariadb-server
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version=10.11
+  sudo apt-get update -yq
+  sudo apt-get install -yq debconf-utils
+  sudo debconf-set-selections <<'EOF'
+mariadb-server mariadb-server/feedback-collect boolean false
+mariadb-server-10.11 mariadb-server-10.11/feedback-collect boolean false
+EOF
+  # Finish any half-config first (prevents re-prompt)
+  sudo dpkg --configure -a || true
+  sudo apt-get -f install -yq || true
+
+  sudo apt-get install -yq \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confnew \
+    mariadb-server
   sudo systemctl enable mariadb
   sudo systemctl start mariadb
   echo "MariaDB 10.11 installed and started."
@@ -41,47 +56,27 @@ fi
 echo "Setting up MariaDB database and user..."
 
 DB_NAME="${DB_NAME:-lca}"
-DB_USER="${DB_USER:-lca}"        # tolerate unset -> default
+DB_USER="${DB_USER:-lca}"
 DB_PASS="${DB_PASSWORD:-lca}"
 
-# Bounded readiness wait (max ~2 minutes)
-echo "Waiting for MariaDB socket to be ready..."
-ready=0
-for i in $(seq 1 60); do
-  if sudo mysqladmin --protocol=socket ping >/dev/null 2>&1; then
-    ready=1
-    break
-  fi
-  echo "  ...not ready yet ($i/60)"
+until sudo mariadb -e "SELECT 1;" >/dev/null 2>&1; do
+  echo "Waiting for MariaDB to start..."
   sleep 2
 done
 
-if [ "$ready" -ne 1 ]; then
-  echo "MariaDB did not become ready in time — showing status and recent logs:"
-  sudo systemctl status mariadb --no-pager || true
-  sudo journalctl -u mariadb --no-pager -n 200 || true
-  exit 1
-fi
-echo "MariaDB is ready."
+sudo mariadb -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
+USER_EXISTS=$(sudo mariadb -N -e "SELECT COUNT(*) FROM mysql.user WHERE user = '${DB_USER}' AND host = 'localhost';")
 
-# Use short timeouts so client never hangs indefinitely
-SQL_OPTS=(--connect-timeout=5 --wait-timeout=5 --protocol=socket)
-
-sudo mariadb "${SQL_OPTS[@]}" -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
-# Check if user exists
-USER_EXISTS=$(sudo mariadb "${SQL_OPTS[@]}" -N -e \
-  "SELECT COUNT(*) FROM mysql.user WHERE user='${DB_USER}' AND host='localhost';" || echo 0)
-
-if [ "${USER_EXISTS}" = "0" ]; then
+if [ "$USER_EXISTS" -eq 0 ]; then
   echo "Creating MariaDB user '${DB_USER}'..."
-  sudo mariadb "${SQL_OPTS[@]}" -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+  sudo mariadb -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
 else
   echo "User '${DB_USER}' exists. Updating password..."
-  sudo mariadb "${SQL_OPTS[@]}" -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+  sudo mariadb -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
 fi
 
-sudo mariadb "${SQL_OPTS[@]}" -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
-sudo mariadb "${SQL_OPTS[@]}" -e "FLUSH PRIVILEGES;"
+sudo mariadb -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+sudo mariadb -e "FLUSH PRIVILEGES;"
 echo "MariaDB database '${DB_NAME}' and user '${DB_USER}' configured."
 
 # ------------------ OpenSearch 2.19 ------------------
@@ -104,7 +99,7 @@ else
   sudo chown -R opensearch:opensearch /usr/share/opensearch
 
   echo "Disabling OpenSearch SSL and security plugin..."
-  sudo rm -rf rm -rf /usr/share/opensearch/config/opensearch-security
+  sudo rm -rf /usr/share/opensearch/config/opensearch-security
   echo "plugins.security.disabled: true" | sudo tee -a /usr/share/opensearch/config/opensearch.yml
   echo "Creating systemd service for OpenSearch..."
   sudo bash -c 'cat > /etc/systemd/system/opensearch.service' <<EOF
@@ -171,6 +166,7 @@ else
   echo "Installing Tomcat 10.1.20..."
   curl -O https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.20/bin/apache-tomcat-10.1.20.tar.gz
   tar -xzf apache-tomcat-10.1.20.tar.gz
+  sudo rm -rf /opt/tomcat
   sudo mv apache-tomcat-10.1.20 /opt/tomcat
   sudo chmod +x /opt/tomcat/bin/*.sh
 
