@@ -1,0 +1,289 @@
+#!/bin/bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# make ALL apt/dpkg operations non-interactive
+export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_PRIORITY=critical
+
+
+echo "Starting prerequisite installation..."
+
+# ------------------ Java 21.0.3 ------------------
+echo "Checking Java 21..."
+if java -version 2>&1 | grep "21.0.3"; then
+  echo "Java 21.0.3 is already installed."
+else
+  echo "Installing Java 21.0.3..."
+  sudo apt-get update
+  sudo apt-get install -y wget
+  wget https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.3%2B9/OpenJDK21U-jdk_x64_linux_hotspot_21.0.3_9.tar.gz
+  sudo mkdir -p /opt/java
+  sudo tar -xzf OpenJDK21U-jdk_x64_linux_hotspot_21.0.3_9.tar.gz -C /opt/java
+  echo "export JAVA_HOME=/opt/java/jdk-21.0.3+9" | sudo tee /etc/profile.d/java.sh
+  echo 'export PATH=$JAVA_HOME/bin:$PATH' | sudo tee -a /etc/profile.d/java.sh
+  source /etc/profile.d/java.sh
+  echo "Java 21.0.3 installed."
+fi
+
+# ------------------ MariaDB 10.11 ------------------
+echo "Checking MariaDB..."
+if mariadb --version 2>/dev/null | grep "10.11"; then
+  echo "MariaDB 10.11 is already installed."
+else
+  echo "Installing MariaDB 10.11..."
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version=10.11
+  sudo apt-get update -yq
+  sudo apt-get install -yq debconf-utils
+  sudo debconf-set-selections <<'EOF'
+mariadb-server mariadb-server/feedback-collect boolean false
+mariadb-server-10.11 mariadb-server-10.11/feedback-collect boolean false
+EOF
+  # Finish any half-config first (prevents re-prompt)
+  sudo dpkg --configure -a || true
+  sudo apt-get -f install -yq || true
+
+  sudo apt-get install -yq \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confnew \
+    mariadb-server
+  sudo systemctl enable mariadb
+  sudo systemctl start mariadb
+  echo "MariaDB 10.11 installed and started."
+fi
+
+# ------------------ MariaDB Database & User Setup ------------------
+echo "Setting up MariaDB database and user..."
+
+DB_NAME="${DB_NAME:-lca}"
+DB_USER="${DB_USER:-lca}"
+DB_PASS="${DB_PASSWORD:-lca}"
+
+until sudo mariadb -e "SELECT 1;" >/dev/null 2>&1; do
+  echo "Waiting for MariaDB to start..."
+  sleep 2
+done
+
+sudo mariadb -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;"
+USER_EXISTS=$(sudo mariadb -N -e "SELECT COUNT(*) FROM mysql.user WHERE user = '${DB_USER}' AND host = 'localhost';")
+
+if [ "$USER_EXISTS" -eq 0 ]; then
+  echo "Creating MariaDB user '${DB_USER}'..."
+  sudo mariadb -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+else
+  echo "User '${DB_USER}' exists. Updating password..."
+  sudo mariadb -e "ALTER USER '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+fi
+
+sudo mariadb -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
+sudo mariadb -e "FLUSH PRIVILEGES;"
+echo "MariaDB database '${DB_NAME}' and user '${DB_USER}' configured."
+
+# ------------------ OpenSearch 2.19 ------------------
+echo "Checking OpenSearch..."
+if [ -d "/usr/share/opensearch" ] && /usr/share/opensearch/bin/opensearch --version | grep "2.19"; then
+  echo "OpenSearch 2.19 is already installed."
+else
+  echo "Installing OpenSearch 2.19..."
+  curl -L -O https://artifacts.opensearch.org/releases/bundle/opensearch/2.19.0/opensearch-2.19.0-linux-x64.tar.gz
+  tar -xzf opensearch-2.19.0-linux-x64.tar.gz
+  sudo mv opensearch-2.19.0 /usr/share/opensearch
+  sudo chmod -R 755 /usr/share/opensearch
+
+  if id "opensearch" &>/dev/null; then
+    echo "User 'opensearch' already exists."
+  else
+    echo "Creating user 'opensearch'..."
+    sudo useradd --no-create-home --system --shell /usr/sbin/nologin opensearch
+  fi
+  sudo chown -R opensearch:opensearch /usr/share/opensearch
+
+  echo "Disabling OpenSearch SSL and security plugin..."
+  sudo rm -rf /usr/share/opensearch/config/opensearch-security
+  echo "plugins.security.disabled: true" | sudo tee -a /usr/share/opensearch/config/opensearch.yml
+  echo "Creating systemd service for OpenSearch..."
+  sudo bash -c 'cat > /etc/systemd/system/opensearch.service' <<EOF
+[Unit]
+Description=OpenSearch
+Documentation=https://opensearch.org/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=opensearch
+Group=opensearch
+Environment=OPENSEARCH_HOME=/usr/share/opensearch
+WorkingDirectory=/usr/share/opensearch
+ExecStart=/usr/share/opensearch/bin/opensearch
+Restart=always
+LimitNOFILE=65536
+LimitNPROC=4096
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable opensearch
+  sudo systemctl start opensearch
+  echo "Waiting for OpenSearch to start on port 9200..."
+  for i in {1..30}; do
+    if curl -s http://localhost:9200 >/dev/null; then
+      echo "OpenSearch is up!"
+      break
+    else
+      echo "OpenSearch not ready yet... ($i/30)"
+      sleep 5
+    fi
+  done
+
+  # Optional: Fail if it still hasn't started
+  if ! curl -s http://localhost:9200 >/dev/null; then
+    echo "OpenSearch failed to start on port 9200 after waiting."
+    exit 1
+  fi
+
+  # Now make your request
+  echo "Creating index 'collaboration-server'..."
+  curl --location --request PUT 'http://localhost:9200/collaboration-server' \
+    --header 'Content-Type: application/json' \
+    --data '{
+      "mappings": {
+        "properties": {}
+      }
+    }'
+
+  echo "OpenSearch 2.19 installed and started."
+fi
+
+# ------------------ Tomcat 10.1.20 ------------------
+echo "Checking Tomcat..."
+if [ -d "/opt/tomcat" ] && /opt/tomcat/bin/version.sh | grep "10.1.20"; then
+  echo "Tomcat 10.1.20 is already installed."
+else
+  echo "Installing Tomcat 10.1.20..."
+  curl -O https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.20/bin/apache-tomcat-10.1.20.tar.gz
+  tar -xzf apache-tomcat-10.1.20.tar.gz
+  sudo rm -rf /opt/tomcat
+  sudo mv apache-tomcat-10.1.20 /opt/tomcat
+  sudo chmod +x /opt/tomcat/bin/*.sh
+
+  echo "Creating systemd service for Tomcat..."
+  sudo bash -c 'cat > /etc/systemd/system/tomcat.service' <<EOF
+[Unit]
+Description=Apache Tomcat
+After=network.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+Environment=JAVA_HOME=/opt/java/jdk-21.0.3+9
+Environment=CATALINA_PID=/opt/tomcat/temp/tomcat.pid
+Environment=CATALINA_HOME=/opt/tomcat
+Environment=CATALINA_BASE=/opt/tomcat
+ExecStart=/opt/tomcat/bin/startup.sh
+ExecStop=/opt/tomcat/bin/shutdown.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable tomcat
+  sudo systemctl start tomcat
+  echo "Tomcat 10.1.20 installed and started."
+fi
+
+# ------------------ Nginx 1.28.x ------------------
+echo "Checking Nginx 1.28..."
+installed_version=$(nginx -v 2>&1 | grep -o '[0-9.]*' || true)
+
+if [[ "$installed_version" == 1.28.* ]]; then
+  echo "Nginx 1.28 is already installed (version: $installed_version)."
+else
+  echo "Installing Nginx 1.28..."
+  sudo apt-get update
+  sudo apt-get install -y curl gnupg2 ca-certificates lsb-release
+  curl https://nginx.org/keys/nginx_signing.key | gpg --dearmor | sudo tee /usr/share/keyrings/nginx-archive-keyring.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | sudo tee /etc/apt/sources.list.d/nginx.list
+  sudo apt-get update
+  sudo apt-get install -y nginx=1.28.* || {
+    echo "Failed to install Nginx 1.28 — version may not be available.";
+    exit 1;
+  }
+  echo "Nginx 1.28 installed. Version: $(nginx -v 2>&1)"
+fi
+
+# ------------------ Postfix with Outlook SMTP ------------------
+echo "Configuring Postfix to use Outlook SMTP..."
+
+# Check if Postfix is installed
+if ! dpkg -l | grep -q postfix; then
+  echo "Installing Postfix..."
+  export DEBIAN_FRONTEND=noninteractive
+  echo "postfix postfix/mailname string $(hostname)" | sudo debconf-set-selections
+  echo "postfix postfix/main_mailer_type string 'Internet Site'" | sudo debconf-set-selections
+  sudo apt-get update
+  sudo apt-get install -y postfix mailutils libsasl2-modules
+else
+  echo "Postfix is already installed."
+fi
+
+EMAIL_USER="${EMAIL_USER:?lca}"
+EMAIL_PASS="${EMAIL_PASS:?lca}"
+
+# Ensure required environment variables are set
+if [ -z "$EMAIL_USER" ] || [ -z "$EMAIL_PASS" ]; then
+  echo "ERROR: OUTLOOK_USER and OUTLOOK_PASS environment variables must be set."
+  exit 1
+fi
+
+# Configure Postfix main.cf
+sudo postconf -e "relayhost = [smtp.gmail.com]:587"
+sudo postconf -e "smtp_use_tls = yes"
+sudo postconf -e "smtp_tls_security_level = encrypt"
+sudo postconf -e "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
+sudo postconf -e "smtp_sasl_auth_enable = yes"
+sudo postconf -e "smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd"
+sudo postconf -e "smtp_sasl_security_options = noanonymous"
+sudo postconf -e "smtp_sasl_mechanism_filter = plain, login"
+
+# Create sasl_passwd file with Outlook credentials
+sudo bash -c "cat > /etc/postfix/sasl_passwd <<EOF
+[smtp.gmail.com]:587 $EMAIL_USER:$EMAIL_PASS
+EOF"
+
+# Secure and compile sasl_passwd
+sudo postmap /etc/postfix/sasl_passwd
+sudo chmod 600 /etc/postfix/sasl_passwd /etc/postfix/sasl_passwd.db
+
+# Restart Postfix
+sudo systemctl restart postfix
+
+echo "Postfix is now configured to send mail via Outlook SMTP."
+
+# ------------------ Cypress Required Dependencies ------------------
+echo "Installing Cypress system dependencies..."
+
+sudo apt-get update
+sudo apt-get install -y \
+  libgtk-3-0 \
+  libnotify-dev \
+  libgconf-2-4 \
+  libnss3 \
+  libxss1 \
+  libasound2 \
+  libxtst6 \
+  libx11-xcb1 \
+  libgbm1 \
+  xvfb
+
+echo "Cypress dependencies installed."
+
+
+
+echo "All prerequisites installed successfully."

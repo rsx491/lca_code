@@ -1,4 +1,4 @@
-/.mvn
+/.mvn  
 
 /search/target/
 /search/.classpath
@@ -27,3 +27,4 @@
 /frontend/.vscode/
 
 /.idea/
+/**/node_modules/
